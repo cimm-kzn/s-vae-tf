@@ -18,7 +18,10 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import tensorflow.compat.v2 as tf
+
 import math
+import numpy as np
 
 from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import dtypes
@@ -28,23 +31,70 @@ from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import check_ops
 from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import random_ops
-from tensorflow.python.ops.distributions import distribution
-from tensorflow.python.ops.distributions import kullback_leibler
+from tensorflow_probability.python.distributions import distribution
+from tensorflow_probability.python.distributions import kullback_leibler
 
 from tensorflow.python.ops import control_flow_ops
 from tensorflow.python.ops import gen_math_ops
 from tensorflow.python.ops import gen_array_ops
 from tensorflow.python.ops import linalg_ops
 from tensorflow.python.ops import nn_impl
-from tensorflow.python.ops.distributions.beta import Beta
+
+from tensorflow_probability.python.internal import tensorshape_util
+from tensorflow_probability.python.util.seed_stream import SeedStream
+
+from tensorflow_probability.python.distributions.beta import Beta
+
+import tensorflow_probability as tfp
+tfd = tfp.python.distributions
 
 from hyperspherical_vae.ops.ive import ive
 from hyperspherical_vae.distributions.hyperspherical_uniform import HypersphericalUniform
+
+import scipy.special
 
 __all__ = [
     "VonMisesFisher",
 ]
 
+
+@tf.function
+def _bessel_ive(v, z, cache=None):
+    """Computes I_v(z)*exp(-abs(z)) using a recurrence relation, where z > 0."""
+    # TODO(b/67497980): Switch to a more numerically faithful implementation.
+    z = tf.convert_to_tensor(z)
+
+    wrap = lambda result: tf.debugging.check_numerics(result, 'besseli{}'.format(v))
+
+    if v >= 2:
+        raise ValueError('Evaluating bessel_i by recurrence becomes imprecise for large v')
+
+    cache = cache or {}
+    safe_z = tf.where(z > 0, z, tf.ones_like(z))
+    if v in cache:
+        return wrap(cache[v])
+    if v == 0:
+        cache[v] = tf.math.bessel_i0e(z)
+    elif v == 1:
+        cache[v] = tf.math.bessel_i1e(z)
+    elif v == 0.5:
+        # sinh(x)*exp(-abs(x)), sinh(x) = (e^x - e^{-x}) / 2
+        sinhe = lambda x: (tf.exp(x - tf.abs(x)) - tf.exp(-x - tf.abs(x))) / 2
+        cache[v] = (
+            np.sqrt(2 / np.pi) * sinhe(z) *
+            tf.where(z > 0, tf.math.rsqrt(safe_z), tf.ones_like(safe_z)))
+    elif v == -0.5:
+        # cosh(x)*exp(-abs(x)), cosh(x) = (e^x + e^{-x}) / 2
+        coshe = lambda x: (tf.exp(x - tf.abs(x)) + tf.exp(-x - tf.abs(x))) / 2
+        cache[v] = (
+            np.sqrt(2 / np.pi) * coshe(z) *
+            tf.where(z > 0, tf.math.rsqrt(safe_z), tf.ones_like(safe_z)))
+    if v <= 1:
+        return wrap(cache[v])
+    # Recurrence relation:         
+    cache[v] = (_bessel_ive(v - 1, z, cache) - _bessel_ive(v, z, cache) * (v + z) / z)
+    
+    return wrap(cache[v])
 
 class VonMisesFisher(distribution.Distribution):
     """The von-Mises-Fisher distribution with location `loc` and `scale` parameters.
@@ -95,7 +145,7 @@ class VonMisesFisher(distribution.Distribution):
 
         super(VonMisesFisher, self).__init__(
             dtype=self._scale.dtype,
-            reparameterization_type=distribution.FULLY_REPARAMETERIZED,
+            reparameterization_type=tfd.FULLY_REPARAMETERIZED,
             validate_args=validate_args,
             allow_nan_stats=allow_nan_stats,
             parameters=parameters,
@@ -105,6 +155,12 @@ class VonMisesFisher(distribution.Distribution):
         self.__m = math_ops.cast(self._loc.shape[-1], dtypes.int32)
         self.__mf = math_ops.cast(self.__m, dtype=self.dtype)
         self.__e1 = array_ops.one_hot([0], self.__m, dtype=self.dtype)
+                
+    
+    @classmethod
+    def _params_event_ndims(cls):
+        return dict(loc=1, scale=0)
+    
 
     @staticmethod
     def _param_shapes(sample_shape):
@@ -136,29 +192,38 @@ class VonMisesFisher(distribution.Distribution):
         return constant_op.constant([], dtype=dtypes.int32)
 
     def _event_shape(self):
-        return tensor_shape.scalar()
+        return tf.TensorShape([])
 
     def _sample_n(self, n, seed=None):
+        seed = SeedStream(seed, salt='vom_mises_fisher')
         shape = array_ops.concat([[n], self.batch_shape_tensor()], 0)
         w = control_flow_ops.cond(gen_math_ops.equal(self.__m, 3),
-                                  lambda: self.__sample_w3(n, seed),
-                                  lambda: self.__sample_w_rej(n, seed))
+                                  lambda: self.__sample_w3(n, seed()),
+                                  lambda: self.__sample_w_rej(n, seed()))
 
         v = nn_impl.l2_normalize(array_ops.transpose(
-            array_ops.transpose(random_ops.random_normal(shape, dtype=self.dtype, seed=seed))[1:]), axis=-1)
+            array_ops.transpose(random_ops.random_normal(shape, dtype=self.dtype, seed=seed()))[1:]), axis=-1)
 
-        x = array_ops.concat((w, math_ops.sqrt(1 - w ** 2) * v), axis=-1)
+        x = array_ops.concat((w, math_ops.sqrt(tf.maximum(1 - w ** 2, 0.)) * v), axis=-1)
         z = self.__householder_rotation(x)
 
         return z
 
     def __sample_w3(self, n, seed):
+        seed = SeedStream(seed, salt='von_mises_fisher_3d')
         shape = array_ops.concat(([n], self.batch_shape_tensor()[:-1], [1]), 0)
-        u = random_ops.random_uniform(shape, dtype=self.dtype, seed=seed)
-        self.__w = 1 + math_ops.reduce_logsumexp([math_ops.log(u), math_ops.log(1 - u) - 2 * self.scale], axis=0) / self.scale
+        u = random_ops.random_uniform(shape, dtype=self.dtype, seed=seed())
+        
+        safe_conc = tf.where(self.scale > 0, self.scale, tf.ones_like(self.scale))
+        safe_u = tf.where(u > 0, u, tf.ones_like(u))
+        
+        w = 1 + math_ops.reduce_logsumexp([math_ops.log(safe_u), math_ops.log(1 - safe_u) - 2 * safe_conc], axis=0) / safe_conc
+        w = tf.where(self.scale > 0., w, 2 * u - 1)
+        self.__w = tf.where(tf.equal(u, 0), -tf.ones_like(w), w)
         return self.__w
 
     def __sample_w_rej(self, n, seed):
+        seed = SeedStream(seed, salt='von_mises_fisher_rej')
         c = math_ops.sqrt((4 * (self.scale ** 2)) + (self.__mf - 1) ** 2)
         b_true = (-2 * self.scale + c) / (self.__mf - 1)
         
@@ -171,18 +236,19 @@ class VonMisesFisher(distribution.Distribution):
         a = (self.__mf - 1 + 2 * self.scale + c) / 4
         d = (4 * a * b) / (1 + b) - (self.__mf - 1) * math_ops.log(self.__mf - 1)
 
-        self.__b, (self.__e, self.__w) = b, self.__while_loop(b, a, d, n, seed)
+        self.__b, (self.__e, self.__w) = b, self.__while_loop(b, a, d, n, seed())
         return self.__w
 
     def __while_loop(self, b, a, d, n, seed):
+        seed = SeedStream(seed, salt='von_mises_fisher_while_loop')
         def __cond(w, e, bool_mask, b, a, d):
             return math_ops.reduce_any(bool_mask)
 
         def __body(w_, e_, bool_mask, b, a, d):
             e = math_ops.cast(Beta((self.__mf - 1) / 2, (self.__mf - 1) / 2).sample(
-                shape, seed=seed), dtype=self.dtype)
+                shape, seed=seed()), dtype=self.dtype)
 
-            u = random_ops.random_uniform(shape, dtype=self.dtype, seed=seed)
+            u = random_ops.random_uniform(shape, dtype=self.dtype, seed=seed())
 
             w = (1 - (1 + b) * e) / (1 - (1 - b) * e)
             t = (2 * a * b) / (1 - (1 - b) * e)
@@ -208,8 +274,8 @@ class VonMisesFisher(distribution.Distribution):
         return e, w
 
     def __householder_rotation(self, x):
-        u = nn_impl.l2_normalize(self.__e1 - self._loc, axis=-1)
-        z = x - 2 * math_ops.reduce_sum(x * u, axis=-1, keepdims=True) * u
+        u = tf.math.l2_normalize(self.__e1 - self._loc, axis=-1)
+        z = x - 2 * tf.reduce_sum(x * u, axis=-1, keepdims=True) * u
         return z
 
     def _log_prob(self, x):
@@ -226,8 +292,13 @@ class VonMisesFisher(distribution.Distribution):
         return array_ops.reshape(output, ops.convert_to_tensor(array_ops.shape(output)[:-1]))
 
     def _log_normalization(self):
-        output = -((self.__mf / 2 - 1) * math_ops.log(self.scale) - (self.__mf / 2) * math.log(2 * math.pi) - (
-                    self.scale + math_ops.log(ive(self.__mf / 2 - 1, self.scale))))
+        safe_conc = tf.where(self.scale > 0, self.scale, tf.ones_like(self.scale))
+        output = -((self.__mf / 2 - 1) * math_ops.log(safe_conc) - (self.__mf / 2) * math.log(2 * math.pi) - (
+                    tf.abs(safe_conc) + math_ops.log(ive(self.__mf / 2 - 1, safe_conc))))
+                    
+        log_nsphere_surface_area = (np.log(2.) + (self.__mf / 2) * np.log(np.pi) - tf.math.lgamma(tf.cast(self.__mf / 2, self.dtype)))
+        
+        output = tf.where(self.scale > 0, output, log_nsphere_surface_area)
 
         return array_ops.reshape(output, ops.convert_to_tensor(array_ops.shape(output)[:-1]))
 

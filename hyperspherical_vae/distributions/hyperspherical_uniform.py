@@ -18,6 +18,8 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import tensorflow.compat.v2 as tf
+
 import math
 
 from tensorflow.python.framework import constant_op
@@ -28,12 +30,16 @@ from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import check_ops
 from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import random_ops
-from tensorflow.python.ops.distributions import distribution
+from tensorflow_probability.python.distributions import distribution
+
+from tensorflow_probability.python.util.seed_stream import SeedStream
 
 from tensorflow.python.ops import nn_impl
 from tensorflow.python.framework.tensor_shape import TensorShape
 from tensorflow.python.ops import gen_math_ops
 
+import tensorflow_probability as tfp
+tfd = tfp.python.distributions
 
 class HypersphericalUniform(distribution.Distribution):
     """Hyperspherical Uniform distribution with `dim` parameter.
@@ -71,7 +77,7 @@ class HypersphericalUniform(distribution.Distribution):
 
             super(HypersphericalUniform, self).__init__(
                 dtype=dtype,
-                reparameterization_type=distribution.FULLY_REPARAMETERIZED,
+                reparameterization_type=tfd.FULLY_REPARAMETERIZED,
                 validate_args=validate_args,
                 allow_nan_stats=allow_nan_stats,
                 parameters=parameters,
@@ -100,11 +106,12 @@ class HypersphericalUniform(distribution.Distribution):
         return tensor_shape.scalar()
 
     def _sample_n(self, n, seed=None):
+        seed = SeedStream(seed, salt='hyperspherical_uniform_n')
         return nn_impl.l2_normalize(random_ops.random_normal(shape=array_ops.concat(([n], [self._dim + 1]), 0),
-                                                             dtype=self.dtype, seed=seed), axis=-1)
+                                                             dtype=self.dtype, seed=seed()), axis=-1)
 
     def _log_prob(self, x):
-        return - array_ops.ones(shape=array_ops.shape(x)[:-1], dtype=self.dtype) * self.__log_surface_area()
+        return -array_ops.ones(shape=array_ops.shape(x)[:-1], dtype=self.dtype) * self.__log_surface_area()
 
     def _prob(self, x):
         return math_ops.exp(self._log_prob(x))
